@@ -1,84 +1,146 @@
+import os
 import requests
-from dhooks import Webhook, Embed
-import time
+import discord
+from discord.ext import commands, tasks
+from dotenv import load_dotenv
 
-DISCORD_WEBHOOK_URL = ''
-LTC_ADDRESS = ''
+# ----------------- CONFIG -----------------
+load_dotenv()
+BOT_TOKEN = os.getenv("DISCORD_TOKEN")          # put in .env
+WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK")      # put in .env
+LTC_ADDRESS = ""
+GUILD_ID = 
+# ------------------------------------------
 
-ltcpriceusd = 0
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-def fetch_ltc_price():
-    global ltcpriceusd
+last_hash = None
+
+
+# --------- Utility functions ----------
+def get_ltc_price_usd() -> float:
     try:
-        response = requests.get('https://min-api.cryptocompare.com/data/price?fsym=LTC&tsyms=USD')
-        data = response.json()
-        ltcpriceusd = data['USD']
-    except Exception as error:
-        print('Error fetching LTC price:', error)
+        data = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd",
+            timeout=10,
+        ).json()
+        return data["litecoin"]["usd"]
+    except Exception as e:
+        print("Price fetch error:", e)
+        return 0
 
-def send(embed_data):
-    webhook = Webhook(DISCORD_WEBHOOK_URL)
-    webhook.send(embed=embed_data)
 
-def ltc_notifier():
-    endpoint = f'https://api.blockcypher.com/v1/ltc/main/addrs/{LTC_ADDRESS}/full'
-    initial_tx_count = 0
-
+def get_wallet_info():
+    """Fetch full LTC address info (balance, txs, etc.)"""
     try:
-        response = requests.get(endpoint)
-        data = response.json()
-        initial_tx_count = data['n_tx']
-        print('Connected with address:', LTC_ADDRESS)
-        print(f'Initial transaction count: {initial_tx_count}')
-        print('- S H A R K T O O T H S')
-    except Exception as error:
-        print('Error:', error)
+        resp = requests.get(
+            f"https://api.blockcypher.com/v1/ltc/main/addrs/{LTC_ADDRESS}/full",
+            timeout=15,
+        ).json()
+        return resp
+    except Exception as e:
+        print("Wallet info error:", e)
+        return None
+
+
+async def send_webhook_notification(hash, ltc_amount, usd_amount, sender, ltc_price):
+    webhook = discord.SyncWebhook.from_url(WEBHOOK_URL)
+    embed = discord.Embed(title="💰 New LTC Transaction", color=0x00FF00)
+    embed.add_field(
+        name="Hash",
+        value=f"[{hash}](https://live.blockcypher.com/ltc/tx/{hash})",
+        inline=False,
+    )
+    embed.add_field(name="Amount", value=f"{ltc_amount:.8f} LTC (${usd_amount:.2f})", inline=False)
+    embed.add_field(name="Sent From", value=sender, inline=False)
+    embed.add_field(name="LTC Price", value=f"${ltc_price:.2f}", inline=False)
+    webhook.send(embed=embed)
+
+
+# --------- Background Task ----------
+@tasks.loop(seconds=60)
+async def transaction_check():
+    global last_hash
+    data = get_wallet_info()
+    if not data or "txs" not in data:
         return
 
-    while True:
-        time.sleep(15)
+    latest_tx = data["txs"][0]
+    latest_hash = latest_tx["hash"]
 
-        try:
-            response = requests.get(endpoint)
-            data = response.json()
+    if latest_hash != last_hash:
+        # calculate how much was received
+        ltc_amount = sum(
+            o["value"] / 1e8
+            for o in latest_tx["outputs"]
+            if "addresses" in o and LTC_ADDRESS in o["addresses"]
+        )
+        if ltc_amount > 0:
+            ltc_price = get_ltc_price_usd()
+            usd_amount = ltc_amount * ltc_price
+            sender = (
+                latest_tx["inputs"][0]["addresses"][0]
+                if "inputs" in latest_tx and "addresses" in latest_tx["inputs"][0]
+                else "Unknown"
+            )
+            await send_webhook_notification(latest_hash, ltc_amount, usd_amount, sender, ltc_price)
 
-            if response.status_code == 429:
-                print(data)
-                break
+        last_hash = latest_hash
 
-            current_tx_count = data['n_tx']
-            print(current_tx_count)
 
-            if current_tx_count > initial_tx_count:
-                tx_data = data['txs'][0]
-                tx_hash = tx_data['hash']
-                outputs = tx_data['outputs']
-                ltc_amount = 0
-                usd_amount = 0
+# --------- Commands ----------
+@bot.command()
+async def balance(ctx):
+    """Check total LTC balance & USD value"""
+    data = get_wallet_info()
+    if not data:
+        await ctx.send("⚠️ Could not fetch balance.")
+        return
 
-                for output in outputs:
-                    if output['addresses'][0] == LTC_ADDRESS:
-                        ltc_amount = output['value'] / 1e8
-                        usd_amount = ltc_amount * ltcpriceusd
+    balance_ltc = data.get("balance", 0) / 1e8
+    ltc_price = get_ltc_price_usd()
+    usd_value = balance_ltc * ltc_price
 
-                usd_amount_str = f'{usd_amount:.2f}'
-                ltc_amount_str = f'{ltc_amount:.8f}'
+    embed = discord.Embed(title="🏦 Wallet Balance", color=0x3498db)
+    embed.add_field(name="LTC", value=f"{balance_ltc:.8f} LTC", inline=False)
+    embed.add_field(name="USD", value=f"${usd_value:.2f}", inline=False)
+    embed.add_field(name="LTC Price", value=f"${ltc_price:.2f}", inline=False)
 
-                embed_data = Embed(
-                    title='LTC Notifier',
-                    description=f'**Hash:** [{tx_hash}](https://blockchair.com/litecoin/transaction/{tx_hash})\n'
-                                f'**Amount:** `{ltc_amount_str} LTC`\n'
-                                f'**Now:** `${usd_amount_str} USD`',
-                    color=0xFFFFFF
-                )
+    await ctx.send(embed=embed)
 
-                embed_data.set_footer(text='sharktooths.xd')
-                send(embed_data)
-                initial_tx_count = current_tx_count
 
-        except Exception as error:
-            print('Error: ', error)
+@bot.command()
+async def transactions(ctx, count: int = 5):
+    """Show last N transactions"""
+    data = get_wallet_info()
+    if not data or "txs" not in data:
+        await ctx.send("⚠️ Could not fetch transactions.")
+        return
 
-if __name__ == "__main__":
-    fetch_ltc_price()
-    ltc_notifier()
+    txs = data["txs"][:count]
+    embed = discord.Embed(title=f"📜 Last {count} Transactions", color=0x9b59b6)
+    for tx in txs:
+        tx_hash = tx["hash"]
+        ltc_amount = sum(
+            o["value"] / 1e8
+            for o in tx["outputs"]
+            if "addresses" in o and LTC_ADDRESS in o["addresses"]
+        )
+        embed.add_field(
+            name=tx_hash[:10] + "...",
+            value=f"{ltc_amount:.8f} LTC\n[View](https://live.blockcypher.com/ltc/tx/{tx_hash})",
+            inline=False,
+        )
+    await ctx.send(embed=embed)
+
+
+# --------- Events ----------
+@bot.event
+async def on_ready():
+    print(f"✅ Logged in as {bot.user}")
+    transaction_check.start()
+
+
+# --------- Run Bot ----------
+bot.run(BOT_TOKEN)
